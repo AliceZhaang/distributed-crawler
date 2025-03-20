@@ -1,0 +1,440 @@
+
+services:
+  # MongoDB配置服务器
+  mongodb-config:
+    image: mongo:5.0
+    command: mongod --configsvr --replSet configrs --port 27019 --bind_ip_all --wiredTigerCacheSizeGB 0.25 --setParameter maxTransactionLockRequestTimeoutMillis=5000 --logpath /data/logs/mongodb-config.log
+    volumes:
+      - mongodb-config:/data/db
+      - ./logs/mongodb:/data/logs
+      - /etc/localtime:/etc/localtime:ro  # 添加主机时间同步
+    networks:
+      douban-network:
+        aliases:
+          - mongodb-config
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+        reservations:
+          memory: 512M
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # 配置服务器初始化
+  mongodb-config-init:
+    image: mongo:5.0
+    depends_on:
+      mongodb-config:
+        condition: service_healthy
+    networks:
+      - douban-network
+    volumes:
+      - ./logs/mongodb/init:/data/logs  # 添加日志挂载
+    command: >
+      bash -c '
+        echo "Waiting for config server to start..." &&
+        for i in $$(seq 1 10); do
+          echo "尝试初始化配置服务器副本集 (尝试 $$i/10)..." &&
+          mongosh --host mongodb-config --port 27019 --eval '"'"'
+            try {
+              // 先检查副本集状态
+              let isInitialized = false;
+              try {
+                let status = rs.status();
+                if(status.ok) {
+                  print("副本集已初始化，状态正常");
+                  isInitialized = true;
+                }
+              } catch(e) {
+                print("副本集未初始化或状态异常: " + e);
+              }
+              
+              // 如果未初始化，则进行初始化
+              if(!isInitialized) {
+                print("开始初始化副本集...");
+                let result = rs.initiate({
+                  _id: "configrs",
+                  configsvr: true,
+                  members: [
+                    {_id: 0, host: "mongodb-config:27019", priority: 2}
+                  ]
+                });
+                printjson(result);
+                if(!result.ok) {
+                  throw new Error("初始化失败: " + result.errmsg);
+                }
+              }
+              
+              // 等待副本集完全初始化并选出主节点
+              print("等待副本集选举完成...");
+              let attempts = 0;
+              while(attempts < 30) {
+                try {
+                  let status = rs.status();
+                  if(status.members && status.members[0].stateStr === "PRIMARY") {
+                    print("配置服务器已成为PRIMARY节点");
+                    quit(0);
+                  }
+                  print("当前节点状态: " + status.members[0].stateStr);
+                } catch(e) {
+                  print("等待副本集初始化: " + e);
+                }
+                sleep(1000);
+                attempts++;
+              }
+              
+              if(attempts >= 30) {
+                print("等待PRIMARY节点超时，尝试强制设置优先级");
+                try {
+                  let config = rs.conf();
+                  config.members[0].priority = 10;
+                  rs.reconfig(config, {force: true});
+                  print("已强制重新配置副本集");
+                  sleep(5000);
+                  let status = rs.status();
+                  if(status.members && status.members[0].stateStr === "PRIMARY") {
+                    print("强制重新配置后，节点已成为PRIMARY");
+                    quit(0);
+                  } else {
+                    throw new Error("强制重新配置后，节点仍未成为PRIMARY");
+                  }
+                } catch(e) {
+                  print("强制重新配置失败: " + e);
+                  quit(1);
+                }
+              }
+            } catch(e) {
+              print("初始化过程出错: " + e);
+              quit(1);
+            }
+          '"'"' | tee /data/logs/mongodb-config-init-$$i.log
+          
+          # 检查上一个命令的退出状态
+          if [ $$? -eq 0 ]; then
+            echo "配置服务器副本集初始化成功！"
+            exit 0
+          fi
+          
+          echo "初始化失败，等待5秒后重试..."
+          sleep 5
+        done
+        
+        echo "所有重试都失败，初始化配置服务器副本集失败"
+        exit 1
+      '
+    restart: on-failure
+
+  # MongoDB分片服务器
+  mongodb-shard:
+    image: mongo:5.0
+    command: mongod --shardsvr --replSet shardrs --port 27018 --bind_ip_all --wiredTigerCacheSizeGB 0.25 --setParameter maxTransactionLockRequestTimeoutMillis=5000 --logpath /data/logs/mongodb-shard.log
+    volumes:
+      - mongodb-shard:/data/db
+      - ./logs/mongodb:/data/logs
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      douban-network:
+        aliases:
+          - mongodb-shard
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+        reservations:
+          memory: 512M
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # 分片服务器初始化
+  mongodb-shard-init:
+    image: mongo:5.0
+    depends_on:
+      mongodb-shard:
+        condition: service_healthy
+    networks:
+      - douban-network
+    volumes:
+      - ./logs/mongodb/init:/data/logs
+    command: >
+      bash -c '
+        echo "Waiting for shard server to start..." &&
+        for i in $$(seq 1 10); do
+          echo "尝试初始化分片服务器副本集 (尝试 $$i/10)..." &&
+          mongosh --host mongodb-shard --port 27018 --eval '"'"'
+            try {
+              let isInitialized = false;
+              try {
+                let status = rs.status();
+                if(status.ok) {
+                  print("副本集已初始化，状态正常");
+                  isInitialized = true;
+                }
+              } catch(e) {
+                print("副本集未初始化或状态异常: " + e);
+              }
+              
+              if(!isInitialized) {
+                print("开始初始化副本集...");
+                let result = rs.initiate({
+                  _id: "shardrs",
+                  members: [
+                    {_id: 0, host: "mongodb-shard:27018", priority: 2}
+                  ]
+                });
+                printjson(result);
+                if(!result.ok) {
+                  throw new Error("初始化失败: " + result.errmsg);
+                }
+              }
+              
+              print("等待副本集选举完成...");
+              let attempts = 0;
+              while(attempts < 30) {
+                try {
+                  let status = rs.status();
+                  if(status.members && status.members[0].stateStr === "PRIMARY") {
+                    print("分片服务器已成为PRIMARY节点");
+                    quit(0);
+                  }
+                  print("当前节点状态: " + status.members[0].stateStr);
+                } catch(e) {
+                  print("等待副本集初始化: " + e);
+                }
+                sleep(1000);
+                attempts++;
+              }
+              throw new Error("等待PRIMARY超时");
+            } catch(e) {
+              print("错误: " + e);
+              quit(1);
+            }
+          '"'"' | tee /data/logs/mongodb-shard-init-$$i.log
+          
+          if [ $$? -eq 0 ]; then
+            echo "分片服务器副本集初始化成功！"
+            exit 0
+          fi
+          
+          echo "初始化失败，等待5秒后重试..."
+          sleep 5
+        done
+        
+        echo "所有重试都失败，初始化分片服务器副本集失败"
+        exit 1
+      '
+    restart: on-failure
+
+  # MongoDB路由服务器
+  mongodb-router:
+    image: mongo:5.0
+    command: mongos --configdb configrs/mongodb-config:27019 --bind_ip_all --logpath /data/logs/mongodb-router.log
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./logs/mongodb:/data/logs
+      - /etc/localtime:/etc/localtime:ro  # 添加主机时间同步
+    environment:
+      - MONGOS_DISABLE_TIMESTAMP_VALIDATION=true
+      - TZ=Asia/Shanghai  # 添加时区设置
+    depends_on:
+      mongodb-config-init:
+        condition: service_completed_successfully
+      mongodb-shard-init:
+        condition: service_completed_successfully
+    networks:
+      douban-network:
+        aliases:
+          - mongodb-router
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # 添加分片到路由器
+  mongodb-add-shard:
+    image: mongo:5.0
+    depends_on:
+      mongodb-router:
+        condition: service_healthy
+    networks:
+      - douban-network
+    volumes:
+      - ./logs/mongodb/init:/data/logs  # 添加日志挂载
+    command: >
+      bash -c '
+        echo "Adding shard to router..." &&
+        mongosh --host mongodb-router --eval '"'"'
+          try {
+            sh.addShard("shardrs/mongodb-shard:27018");
+            sh.enableSharding("douban");
+            print("Successfully added shard");
+            quit(0);
+          } catch(e) {
+            if(e.message.includes("already exists")) {
+              print("Shard already added");
+              quit(0);
+            } else {
+              print("Error adding shard: " + e);
+              quit(1);
+            }
+          }
+        '"'"' | tee /data/logs/mongodb-add-shard.log
+      '
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "exit", "0"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Redis服务
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./logs/redis:/data/logs
+      - /etc/localtime:/etc/localtime:ro  # 添加主机时间同步
+    environment:
+      - TZ=Asia/Shanghai  # 添加时区设置
+    networks:
+      - douban-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    command: redis-server --appendonly yes --save 60 1 --loglevel notice --logfile /data/logs/redis.log  # 添加日志配置
+
+  # 爬虫主控节点
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    volumes:
+      - ./:/app
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - SCRAPY_SETTINGS_MODULE=douban.settings
+      - REDIS_HOST=redis
+      - MONGO_URI=mongodb://mongodb-router:27017
+      - LOG_DIR=/app/logs
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb-router:
+        condition: service_healthy
+    networks:
+      - douban-network
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # 爬虫工作节点1
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - master
+      - redis
+      - mongodb-router
+    volumes:
+      - ./:/app  # 这会将整个项目目录挂载到容器的/app目录
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - SCRAPY_SETTINGS_MODULE=douban.settings
+      - REDIS_HOST=redis
+      - MONGO_URI=mongodb://mongodb-router:27017
+      - NODE_ID=worker1
+      - LOG_DIR=/app/logs
+      - TZ=Asia/Shanghai
+      - CHROMEDRIVER_PATH=/usr/bin/chromedriver
+      - CHROME_PATH=/usr/bin/chromium
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=:99
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - douban-network
+    restart: on-failure:3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # 爬虫工作节点2 
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - master
+      - redis
+      - mongodb-router
+    volumes:
+      - ./:/app  # 这会将整个项目目录挂载到容器的/app目录
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - SCRAPY_SETTINGS_MODULE=douban.settings
+      - REDIS_HOST=redis
+      - MONGO_URI=mongodb://mongodb-router:27017
+      - NODE_ID=worker2
+      - LOG_DIR=/app/logs
+      - TZ=Asia/Shanghai
+      - CHROMEDRIVER_PATH=/usr/bin/chromedriver
+      - CHROME_PATH=/usr/bin/chromium
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=:99
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - douban-network
+    restart: on-failure:3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+
+  # 其他服务保持不变...
+
+networks:
+  douban-network:
+    driver: bridge
+
+volumes:
+  mongodb-config:
+  mongodb-shard:
+  redis-data:

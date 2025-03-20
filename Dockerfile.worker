@@ -1,0 +1,38 @@
+FROM python:3.10
+
+# 安装Chrome相关依赖 - 使用固定版本
+RUN apt-get update && \
+    apt-get install -y \
+    chromium \
+    chromium-driver \
+    xvfb \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置Chrome驱动路径
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV CHROME_PATH=/usr/bin/chromium
+
+WORKDIR /app
+
+# 复制项目文件
+COPY . /app/
+
+# 安装Python依赖
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir redis psutil requests docker pymongo && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 设置Python路径
+ENV PYTHONPATH=/app
+ENV SCRAPY_SETTINGS_MODULE=douban.settings
+ENV IS_DOCKER=true
+
+# 创建浏览器数据目录
+RUN mkdir -p /app/browser_data && chmod 777 /app/browser_data
+
+# 设置Chrome无头模式
+ENV DISPLAY=:99
+
+# 运行工作节点脚本
+CMD ["python", "/app/worker_node.py"]

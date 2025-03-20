@@ -1,0 +1,19 @@
+# 隐私配置文件
+# douban/douban/config.py
+
+# 其他不需要版本控制的文件
+*.pyc
+__pycache__/
+logs/
+*.log
+.env
+
+# IDE配置
+.idea/
+.vscode/
+
+# Python虚拟环境
+venv/
+env/
+.env/
+.venv/
