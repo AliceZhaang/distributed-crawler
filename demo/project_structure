@@ -1,0 +1,18 @@
+distributed_crawler/
+├── crawler/
+│   ├── __init__.py
+│   ├── spiders/
+│   │   ├── __init__.py
+│   │   └── base_spider.py
+│   ├── items.py
+│   ├── middlewares.py
+│   ├── pipelines.py
+│   └── settings.py
+├── scheduler/
+│   ├── __init__.py
+│   └── task_scheduler.py
+├── utils/
+│   ├── __init__.py
+│   └── redis_client.py
+├── requirements.txt
+└── main.py 
